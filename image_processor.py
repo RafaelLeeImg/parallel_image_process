@@ -6,57 +6,63 @@
 
 # import cv2
 import threading
-from threading import Thread
 import os
 import sys
 import time
+import signal
+from threading import Thread
 from typing import Optional
 from typing import List
 from typing import Set
 from typing import NoReturn
 
-import signal
 
 # This code is a test for multi threading, thread pool and automic operations, so I ignored the computer vision part
-# For a more modern approach, Python concurrent could be used
-#                +---------------------------------------+                                    +-------------------------------------------------+
-#                |  ImageFetcher                         |                                    |   ImageProcessor                                |
-#                |  Queue                                |                                    |   Queue                                         |
-#                |  Mutex                                |                                    |   Mutex                                         |
-#                |  1 * Thread(while (1){FetchImage})    |                                    |   n * Thread(while (1){Process})                |
-#                |                                       |                                    |                                                 |
-#                |                                       |                                    |                                                 |
-#                +---------------------------------------+                                    +-------------------------------------------------+
-#                                                ^ ^                                            ^  ^
-#                +--------------------------+    | |       +--------------------------+         |  |   +----------------------------------------+
-#                |  ImageFetcherCamera      |    | |       |  ImageDistributor        |         |  |   |  ImageProcessorCpu                     |
-#                |                          |    | |       |                          |         |  |   |                                        |
-#                |                          |    | |       |                          |         |  |   |                                        |
-#                |                          |    | |       |                          |         |  |   |                                        |
-#                |                          |----+ |       |                          |         |  +---|                                        |
-#                |                          |      |       |                          |         |      |                                        |
-#                +--------------------------+      |       +--------------------------+         |      +----------------------------------------+
-#                                                  |                                            |
-#                +--------------------------+      |                                            |      +----------------------------------------+
-#                |  ImageFetcherDisk        |      |                                            |      |  ImageProcessorGpu                     |
-#                |                          |      |                                            |      |                                        |
-#                |                          |      |                                            |      |                                        |
-#                |                          |------+                                            +------|                                        |
-#                |                          |                                                          |                                        |
-#                |                          |                                                          |                                        |
-#                +--------------------------+                                                          +----------------------------------------+
+# For a more modern approach, Python concurrent programming could be used
+#         +------------------------------------------------+                           +-------------------------------------------------+
+#         |  ImageFetcher                                  |                           |   ImageProcessor                                |
+#         |  variable Queue                                |                           |   variable   Queue                              |
+#         |  variable Mutex                                |                           |   variable   Mutex                              |
+#         |  variable 1 * Thread(while (1){FetchImage})    |                           |   variable   n * Thread(while (1){Process})     |
+#         |  method DequeueImage                           |                           |   method GetQueueLength                         |
+#         |  method GetImageCount                          |                           |   method ThreadFunction                         |
+#         |  method ThreadFunction                         |                           |   method Push                                   |
+#         |  method ThreadStart                            |                           |   method GetQueueSpace                          |
+#         |  method ThreadJoin                             |                           |   method ThreadsStart                           |
+#         |  method FetchImage                             |                           |   method ThreadsJoin                            |
+#         |                                                |                           |   method Process                                |
+#         |                                                |                           |                                                 |
+#         +------------------------------------------------+                           +-------------------------------------------------+
+#                                         ^ ^                                            ^  ^
+#         +--------------------------+    | |       +--------------------------+         |  |   +----------------------------------------+
+#         |  ImageFetcherCamera      |    | |       |  ImageDistributor        |         |  |   |  ImageProcessorCpu                     |
+#         |                          |    | |       |  method FetcherStart     |         |  |   |                                        |
+#         |                          |    | |       |  method ProcessorStart   |         |  |   |                                        |
+#         |                          |    | |       |  method Loop             |         |  |   |                                        |
+#         |                          |----+ |       |                          |         |  +---|                                        |
+#         |                          |      |       |                          |         |      |                                        |
+#         +--------------------------+      |       +--------------------------+         |      +----------------------------------------+
+#                                           |                                            |
+#         +--------------------------+      |                                            |      +----------------------------------------+
+#         |  ImageFetcherDisk        |      |                                            |      |  ImageProcessorGpu                     |
+#         |                          |      |                                            |      |                                        |
+#         |                          |      |                                            |      |                                        |
+#         |                          |------+                                            +------|                                        |
+#         |                          |                                                          |                                        |
+#         |                          |                                                          |                                        |
+#         +--------------------------+                                                          +----------------------------------------+
 
 
 # for debugging
-def tee(a, prefix):
+def tee(a, prefix="debug"):
     print(prefix, a)  # if debug, use this line, if not comment it out
     return a
 
 
 # global variables
-image_queue_max_length = 10
 thread_shall_stop = False
 vacant_seconds_before_stop = 5
+ImageFetcher_queue_length = 10
 ImageProcessor_threads_counts = 2
 ImageProcessor_queue_length = 5
 
@@ -88,10 +94,12 @@ class Image:
 
 
 class ImageFetcher:
-    def __init__(self) -> None:
+    def __init__(self, queue_length=ImageFetcher_queue_length) -> None:
         self.class_name = "ImageFetcher"
         self.local_cache: List[Image] = []
         self.queue_lock = threading.Lock()
+        self.queue_length = queue_length
+        self.thread = Thread(target=self.ThreadFunction, args=[])
         print("ImageFetcher")
 
     def DequeueImage(self) -> Optional[Image]:
@@ -115,16 +123,20 @@ class ImageFetcher:
 
     def ThreadFunction(self) -> None:
         global thread_shall_stop
-        global image_queue_max_length
         while not thread_shall_stop:
             cnt = self.GetImageCount()  # atomic
-            if cnt < image_queue_max_length:
+            if cnt < self.queue_length:
                 self.FetchImage()
             time.sleep(0.1)
 
-    def Start(self):
-        self.thread = Thread(target=self.ThreadFunction, args=[])
+    def ThreadStart(self) -> None:
         self.thread.start()
+
+    def ThreadJoin(self) -> None:
+        if self.thread:
+            self.thread.join()
+        else:
+            raise ValueError('self.thread does not exist, please run self.ThreadStart first')
 
     def FetchImage(self):
         return
@@ -139,9 +151,9 @@ class ImageFetcherDisk(ImageFetcher):
 
     def FetchImage(self) -> int:
         '''check image count and fill queue with Image elements
-        fill the local cache as long as possible while less than image_queue_max_length'''
+        fill the local cache as long as possible while less than self.queue_length'''
         def filter_filename(name: str) -> bool:
-            if (name[-4:] == '.png' or name[-5:] == '.jpeg' or name[-4:] == '.jpg' or name[-4:] == '.svg') and os.path.isfile(os.path.join(self.__path, name)):
+            if os.path.splitext(name)[-1] in ('.png', '.jpg', '.jpeg', '.svg'):
                 return True
             else:
                 return False
@@ -154,8 +166,8 @@ class ImageFetcherDisk(ImageFetcher):
         not_sent = list(set(files_filtered) - self.__sent)  # set operation
         not_sent.sort()
         cnt = self.GetImageCount()  # atomic
-        if cnt < image_queue_max_length:
-            required = image_queue_max_length - cnt
+        if cnt < self.queue_length:
+            required = self.queue_length - cnt
             # the granularity of mutex can be smaller, only self.local_cache and self.__sent matter
             # file read can be exclude outside of mutex
             with self.queue_lock:
@@ -233,6 +245,14 @@ class ImageProcessor:
             if thread_v:
                 thread_v.start()
 
+    def ThreadsJoin(self):
+        '''Join all threads'''
+        for i in range(self.thread_count):
+            print(f"Threads[{i}] Starts")
+            thread_v = self.threads[i]
+            if thread_v:
+                thread_v.join()
+
     def Process(self) -> None:
         '''process no more than 1 image and write to file'''
         image: Optional[Image] = None
@@ -266,7 +286,7 @@ class ImageDistributor:
 
     def FetcherStart(self):
         for i in self.fetchers:
-            i.Start()
+            i.ThreadStart()
 
     def ProcessorStart(self):
         for i in self.processors:
@@ -296,20 +316,14 @@ class ImageDistributor:
 
 
 if __name__ == '__main__':
-    if len(sys.argv) == 1:
+    if len(sys.argv) >= 3:
+        src_dir = sys.argv[1].split(',')
+        dst_dir = sys.argv[2].split(',')
+    else:
         print(f'usage: {sys.argv[0]} SRC_DIR1,SRC_DIR2,...  DST_DIR')
         print(f'example: {sys.argv[0]} /some/dir/A,/some/dir/B  /destination/dir')
         print(f'This program is a program use multi thread pool to process images')
         exit(0)
-    elif len(sys.argv) >= 3:
-        src_dir = sys.argv[1].split(',')
-        dst_dir = sys.argv[2].split(',')
-    else:
-        print(f'length of parameters not right, please check the usage by {sys.argv[0]}')
-        exit(0)
-
-    # src_dir = [r'/Volumes/ramdisk/del/1', r'/Volumes/ramdisk/del/2']
-    # dst_dir = [r'/Volumes/ramdisk/del/dst']
 
     fetchers = []
     for i in src_dir:
@@ -318,24 +332,10 @@ if __name__ == '__main__':
     processor_0 = ImageProcessorGpu(dst_dir[0])
     processor_1 = ImageProcessorCpu(dst_dir[0])
 
-    # print("    fetcher_0.Start()")
-    # fetcher_0.Start()
-
-    # print("    fetcher_1.Start()")
-    # fetcher_1.Start()
-
-    # processor_0.ThreadsStart()
-    # processor_1.ThreadsStart()
     distributor = ImageDistributor(fetchers, [processor_0, processor_1])
     distributor.FetcherStart()
     distributor.ProcessorStart()
     distributor.Loop()
-
-    # while True:
-    #     # print("    processor_1.Push(fetcher_0.DequeueImage())")
-    #     processor_1.Push(fetcher_0.DequeueImage())
-    #     # print("    processor_0.Push(fetcher_0.DequeueImage())")
-    #     processor_0.Push(fetcher_1.DequeueImage())
 
     for i in range(len(src_dir)):
         print(fetchers[i].GetImageCount())
