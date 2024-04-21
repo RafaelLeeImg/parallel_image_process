@@ -1,8 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #!/opt/homebrew/bin/python3.11
 # Author: Rafael Lee
-# Email:
+# Email: rafael.lee2049@protonmail.com
 # Date: 2024 April 20
+
 
 # import cv2
 import threading
@@ -28,6 +29,15 @@ from typing import Generic
 # the critical parts in ImageFetcher are a queue which is a buffer of images, a mutex which controls the access of the queue and a thread to fetch images asynchronously
 # ImageProcessor is a base class, it also has a queue, a mutex and several threads.
 # ImageDistributor fetch images from ImageFetcher and push images to queue in ImageProcessor
+# usage: python3 ./image_process.py
+
+# optimization directions:
+# 1, use some profiling tool like mypy to profiling, then optimize accordingly
+# 2, use asyncio instead of thread pool
+# 3, push multiple Images at one time
+# 4, do not list dir everytime, use a queue for logging
+# 5, use lock-less queue
+
 
 #         +------------------------------------------------+                           +-------------------------------------------------+
 #         |  ImageFetcher                                  |                           |   ImageProcessor                                |
@@ -38,13 +48,13 @@ from typing import Generic
 #         |  method DequeueImage                           |                           |   method GetQueueLength                         |
 #         |  method GetImageCount                          |                           |   method ThreadFunction                         |
 #         |  method ThreadFunction                         |                           |   method Push                                   |
-#         |  method ThreadStart                            |                           |   method GetQueueSpace                          |
-#         |  method ThreadJoin                             |                           |   method ThreadsStart                           |
-#         |  method FetchImage                             |                           |   method ThreadsJoin                            |
-#         |                                                |                           |   method Process                                |
-#         |                                                |                           |                                                 |
-#         +------------------------------------------------+                           +-------------------------------------------------+
-#                                         ^ ^                                            ^  ^
+#         |  method ThreadStart                            | instantiate   instantiate |   method GetQueueSpace                          |
+#         |  method ThreadJoin                             |<-------+      +---------->|   method ThreadsStart                           |
+#         |  method FetchImage                             |        |      |           |   method ThreadsJoin                            |
+#         |                                                |        |      |           |   method Process                                |
+#         |                                                |        |      |           |                                                 |
+#         +------------------------------------------------+        |      |           +-------------------------------------------------+
+#                                         ^ ^                       |      |             ^  ^
 #         +--------------------------+    | |       +--------------------------+         |  |   +----------------------------------------+
 #         |  ImageFetcherCamera      |    | |       |  ImageDistributor        |         |  |   |  ImageProcessorCpu                     |
 #         |                          |    | |       |  method FetcherStart     |         |  |   |                                        |
@@ -56,7 +66,7 @@ from typing import Generic
 #                                           |                                            |
 #         +--------------------------+      |                                            |      +----------------------------------------+
 #         |  ImageFetcherDisk        |      |                                            |      |  ImageProcessorGpu                     |
-#         |                          |      |                                            |      |                                        |
+#         |                          |      |inherit                              inherit|      |                                        |
 #         |                          |      |                                            |      |                                        |
 #         |                          |------+                                            +------|                                        |
 #         |                          |                                                          |                                        |
@@ -71,8 +81,6 @@ def tee(a, prefix="debug"):
 
 
 # typing
-# TypingImageProcessor = TypeVar('TypingImageProcessor', bound=ImageProcessor)
-# TypingImageProcessor = TypeVar('TypingImageProcessor')
 T = TypeVar('T')
 
 
@@ -96,21 +104,28 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 class Image:
+    '''Image with name and content, use with care, class name is conflict with PIL Image class'''
+
     def __init__(self, name: Optional[str] = None, content: Optional[bytes] = None) -> None:
         if name:
             self.filename = name
 
     def SetContent(self, content: bytes) -> None:
+        '''Set the file content of an Image object'''
         self.content = content
 
     def SetName(self, name: str) -> None:
+        '''Set the file name of an Image object'''
         self.filename = name
 
     def Name(self) -> str:
+        '''Get the file name of an Image object'''
         return self.filename
 
 
 class ImageFetcher(Generic[T]):
+    '''Fetch the image and put them to a local buffer'''
+
     def __init__(self, queue_length=ImageFetcher_queue_length) -> None:
         self.class_name = "ImageFetcher"
         self.local_cache: List[Image] = []
@@ -121,7 +136,6 @@ class ImageFetcher(Generic[T]):
 
     def DequeueImage(self) -> Optional[Image]:
         '''Lock queue, and pop 1 element if there are, return None if not exist'''
-
         image: Optional[Image] = None
         with self.queue_lock:
             if len(self.local_cache) > 0:
@@ -139,18 +153,21 @@ class ImageFetcher(Generic[T]):
         return length
 
     def ThreadFunction(self) -> None:
+        '''The function to run in a thread'''
         global thread_shall_stop
         while not thread_shall_stop:
-            cnt = self.GetImageCount()  # atomic
-            if cnt < self.queue_length:
+            items_in_queue = self.GetImageCount()  # atomic
+            if items_in_queue < self.queue_length:
                 self.FetchImage()
             time.sleep(0.1)
 
     def ThreadStart(self) -> None:
+        '''Start threads'''
         print(f"ImageFetcher thread starts")
         self.thread.start()
 
     def ThreadJoin(self) -> None:
+        '''Join threads'''
         print(f"ImageFetcher thread join")
         if self.thread:
             self.thread.join()
@@ -162,6 +179,8 @@ class ImageFetcher(Generic[T]):
 
 
 class ImageFetcherDisk(ImageFetcher[T]):
+    '''Fetch images from local disk'''
+
     def __init__(self, disk_path: str) -> None:
         print("ImageFetcherDisk")
         self.__sent: Set[str] = set([])
@@ -210,12 +229,15 @@ class ImageFetcherDisk(ImageFetcher[T]):
 
 
 class ImageFetcherCamera(ImageFetcher[T]):
+    '''Fetch image from camera with OpenCV v4l2 camera driver'''
+
     def __init__(self) -> None:
         print("ImageFetcherCamera")
         super().__init__()
 
 
 class ImageProcessor(Generic[T]):
+    '''Class for image processing with different backends. Designed in a thread pool fashion'''
     global ImageProcessor_threads_counts
     global ImageProcessor_queue_length
 
@@ -236,6 +258,7 @@ class ImageProcessor(Generic[T]):
             return len(self.queue)
 
     def ThreadFunction(self) -> None:
+        '''The commands to run in the thread'''
         global thread_shall_stop
         while thread_shall_stop == False:
             self.Process()
@@ -248,11 +271,13 @@ class ImageProcessor(Generic[T]):
             self.Process()
 
     def Push(self, image: Optional[Image]) -> None:
+        '''Push image to queue'''
         if image:
             with self.lock:
                 self.queue.append(image)
 
     def GetQueueSpace(self) -> int:
+        '''Calculate how many more item can be put in the queue'''
         with self.lock:
             return self.queue_length - len(self.queue)
 
@@ -288,33 +313,41 @@ class ImageProcessor(Generic[T]):
 
 
 class ImageProcessorCpu(ImageProcessor[T]):
+    '''Process image with CPU'''
+
     def __init__(self, directory: str) -> None:
         super().__init__(directory)
 
 
 class ImageProcessorGpu(ImageProcessor[T]):
+    '''Process image with GPU'''
+
     def __init__(self, directory) -> None:
         super().__init__(directory)
 
 
 class ImageDistributor:
+    '''Manage ImageFetcher and ImageProcessor and the communication between them, with polling'''
+
     def __init__(self, fetchers: List[ImageFetcher], processors: List[ImageProcessor]) -> None:
         self.fetchers = fetchers
         self.processors = processors
         return
 
     def FetcherStart(self) -> None:
+        '''Start ImageFetcher image fetching thread'''
         for i in self.fetchers:
             i.ThreadStart()
 
     def ProcessorStart(self) -> None:
+        '''Start ImageProcessor image processing thread queue'''
         for i in self.processors:
             i.ThreadsStart()
 
     def Loop(self) -> None:
-        '''If there are space in ImageProcessor queue, push image'''
-        '''Stop if there are several seconds without processing'''
-        '''Join threads after stops'''
+        '''If there are space in ImageProcessor queue, push image
+        Stop if there are several seconds without processing
+        Join threads after stops'''
         last_push_time = time.time()
         global thread_shall_stop
         global vacant_seconds_before_stop
@@ -336,7 +369,7 @@ class ImageDistributor:
                             # else:
                             #     raise ValueError('queue empty')
             # check every 1 second
-            time.sleep(1)
+            time.sleep(0.1)
         for fetcher in self.fetchers:
             fetcher.ThreadJoin()
         print('join threads in fetchers')
@@ -345,7 +378,7 @@ class ImageDistributor:
         print('join threads in processors')
 
 
-if __name__ == '__main__':
+def main() -> int:
     if len(sys.argv) >= 3:
         src_dir = sys.argv[1].split(',')
         dst_dir = sys.argv[2].split(',')
@@ -366,3 +399,8 @@ if __name__ == '__main__':
     distributor.FetcherStart()
     distributor.ProcessorStart()
     distributor.Loop()  # join when thread stops
+    return 0
+
+
+if __name__ == '__main__':
+    main()
