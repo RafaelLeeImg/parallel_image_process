@@ -11,19 +11,30 @@ import sys
 import time
 import signal
 from threading import Thread
+from typing import overload
 from typing import Optional
 from typing import List
 from typing import Set
 from typing import NoReturn
+import typing
+from typing import TypeVar
+from typing import Generic
 
+# from typing import Type
 
 # This code is a test for multi threading, thread pool and automic operations, so I ignored the computer vision part
-# For a more modern approach, Python concurrent programming could be used
+# For a more modern approach, Python concurrent programming could be used.
+# ImageFetcher is a base class, while ImageFetcherCamera, ImageFetcherDisk are 2 sub classes
+# the critical parts in ImageFetcher are a queue which is a buffer of images, a mutex which controls the access of the queue and a thread to fetch images asynchronously
+# ImageProcessor is a base class, it also has a queue, a mutex and several threads.
+# ImageDistributor fetch images from ImageFetcher and push images to queue in ImageProcessor
+
 #         +------------------------------------------------+                           +-------------------------------------------------+
 #         |  ImageFetcher                                  |                           |   ImageProcessor                                |
 #         |  variable Queue                                |                           |   variable   Queue                              |
 #         |  variable Mutex                                |                           |   variable   Mutex                              |
 #         |  variable 1 * Thread(while (1){FetchImage})    |                           |   variable   n * Thread(while (1){Process})     |
+#         |  ...                                           |                           |   ...                                           |
 #         |  method DequeueImage                           |                           |   method GetQueueLength                         |
 #         |  method GetImageCount                          |                           |   method ThreadFunction                         |
 #         |  method ThreadFunction                         |                           |   method Push                                   |
@@ -57,6 +68,12 @@ from typing import NoReturn
 def tee(a, prefix="debug"):
     print(prefix, a)  # if debug, use this line, if not comment it out
     return a
+
+
+# typing
+# TypingImageProcessor = TypeVar('TypingImageProcessor', bound=ImageProcessor)
+# TypingImageProcessor = TypeVar('TypingImageProcessor')
+T = TypeVar('T')
 
 
 # global variables
@@ -93,7 +110,7 @@ class Image:
         return self.filename
 
 
-class ImageFetcher:
+class ImageFetcher(Generic[T]):
     def __init__(self, queue_length=ImageFetcher_queue_length) -> None:
         self.class_name = "ImageFetcher"
         self.local_cache: List[Image] = []
@@ -130,19 +147,21 @@ class ImageFetcher:
             time.sleep(0.1)
 
     def ThreadStart(self) -> None:
+        print(f"ImageFetcher thread starts")
         self.thread.start()
 
     def ThreadJoin(self) -> None:
+        print(f"ImageFetcher thread join")
         if self.thread:
             self.thread.join()
         else:
             raise ValueError('self.thread does not exist, please run self.ThreadStart first')
 
-    def FetchImage(self):
-        return
+    def FetchImage(self) -> int:
+        return 0
 
 
-class ImageFetcherDisk(ImageFetcher):
+class ImageFetcherDisk(ImageFetcher[T]):
     def __init__(self, disk_path: str) -> None:
         print("ImageFetcherDisk")
         self.__sent: Set[str] = set([])
@@ -175,7 +194,7 @@ class ImageFetcherDisk(ImageFetcher):
                     # if the count of required image more than the number of not sent images
                     if i >= len(not_sent):
                         break
-                    if not_sent[i]:
+                    if not_sent[i]:  # not None
                         image = Image()
                         image.SetName(not_sent[i])
                         with open(os.path.join(self.__path, image.Name()), 'rb') as fr:
@@ -184,19 +203,19 @@ class ImageFetcherDisk(ImageFetcher):
                         # mark the image as sent
                         self.__sent.add(image.Name())
                     else:
-                        return i
-                return i
+                        return i + 1
+                return i + 1
         else:
             return 0
 
 
-class ImageFetcherCamera(ImageFetcher):
+class ImageFetcherCamera(ImageFetcher[T]):
     def __init__(self) -> None:
         print("ImageFetcherCamera")
         super().__init__()
 
 
-class ImageProcessor:
+class ImageProcessor(Generic[T]):
     global ImageProcessor_threads_counts
     global ImageProcessor_queue_length
 
@@ -216,7 +235,7 @@ class ImageProcessor:
         with self.lock:
             return len(self.queue)
 
-    def ThreadFunction(self):
+    def ThreadFunction(self) -> None:
         global thread_shall_stop
         while thread_shall_stop == False:
             self.Process()
@@ -237,18 +256,18 @@ class ImageProcessor:
         with self.lock:
             return self.queue_length - len(self.queue)
 
-    def ThreadsStart(self):
+    def ThreadsStart(self) -> None:
         '''Start all threads'''
         for i in range(self.thread_count):
-            print(f"Threads[{i}] Starts")
+            print(f"Threads[{i}] starts")
             thread_v = self.threads[i]
             if thread_v:
                 thread_v.start()
 
-    def ThreadsJoin(self):
+    def ThreadsJoin(self) -> None:
         '''Join all threads'''
         for i in range(self.thread_count):
-            print(f"Threads[{i}] Starts")
+            print(f"Threads[{i}] join")
             thread_v = self.threads[i]
             if thread_v:
                 thread_v.join()
@@ -268,12 +287,12 @@ class ImageProcessor:
                 fw.write(image.content)
 
 
-class ImageProcessorCpu(ImageProcessor):
+class ImageProcessorCpu(ImageProcessor[T]):
     def __init__(self, directory: str) -> None:
         super().__init__(directory)
 
 
-class ImageProcessorGpu(ImageProcessor):
+class ImageProcessorGpu(ImageProcessor[T]):
     def __init__(self, directory) -> None:
         super().__init__(directory)
 
@@ -284,17 +303,18 @@ class ImageDistributor:
         self.processors = processors
         return
 
-    def FetcherStart(self):
+    def FetcherStart(self) -> None:
         for i in self.fetchers:
             i.ThreadStart()
 
-    def ProcessorStart(self):
+    def ProcessorStart(self) -> None:
         for i in self.processors:
             i.ThreadsStart()
 
-    def Loop(self):
+    def Loop(self) -> None:
         '''If there are space in ImageProcessor queue, push image'''
         '''Stop if there are several seconds without processing'''
+        '''Join threads after stops'''
         last_push_time = time.time()
         global thread_shall_stop
         global vacant_seconds_before_stop
@@ -309,10 +329,20 @@ class ImageDistributor:
                     # processor_1.Push(fetcher_0.DequeueImage())
                     for i in range(processor.GetQueueSpace()):
                         if fetcher.GetImageCount() > 0:
-                            processor.Push(fetcher.DequeueImage())
+                            img: Optional[Image] = fetcher.DequeueImage()  # atomic
+                            # if img:
+                            processor.Push(img)
                             last_push_time = time.time()
+                            # else:
+                            #     raise ValueError('queue empty')
             # check every 1 second
             time.sleep(1)
+        for fetcher in self.fetchers:
+            fetcher.ThreadJoin()
+        print('join threads in fetchers')
+        for processor in self.processors:
+            processor.ThreadsJoin()
+        print('join threads in processors')
 
 
 if __name__ == '__main__':
@@ -325,17 +355,14 @@ if __name__ == '__main__':
         print(f'This program is a program use multi thread pool to process images')
         exit(0)
 
-    fetchers = []
+    # fetchers: List[typing.Type[ImageFetcher]] = []
+    fetchers: List[ImageFetcher] = []
     for i in src_dir:
         fetchers.append(ImageFetcherDisk(i))
 
-    processor_0 = ImageProcessorGpu(dst_dir[0])
-    processor_1 = ImageProcessorCpu(dst_dir[0])
+    processors: List[ImageProcessor] = [ImageProcessorGpu(dst_dir[0]), ImageProcessorCpu(dst_dir[0])]
 
-    distributor = ImageDistributor(fetchers, [processor_0, processor_1])
+    distributor = ImageDistributor(fetchers, processors)
     distributor.FetcherStart()
     distributor.ProcessorStart()
-    distributor.Loop()
-
-    for i in range(len(src_dir)):
-        print(fetchers[i].GetImageCount())
+    distributor.Loop()  # join when thread stops
